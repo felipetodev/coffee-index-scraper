@@ -1,0 +1,11 @@
+{
+  "compilerOptions": {
+    "strict": true,
+    "target": "ESNext",
+    "lib": ["ESNext", "DOM", "DOM.Iterable"],
+    "types": ["bun"],
+    "skipLibCheck": true,
+    "jsx": "react-jsx",
+    "jsxImportSource": "hono/jsx"
+  }
+}

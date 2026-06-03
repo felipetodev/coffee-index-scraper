@@ -1,0 +1,18 @@
+{
+  "name": "coffee-index-scraper",
+  "license": "MIT",
+  "scripts": {
+    "dev": "bun run src/index.ts",
+    "dev:ig": "DEV_MODE=1 bun run src/index.ts",
+    "api": "bun run src/api/index.ts",
+    "dev:api": "bun run --hot src/api/index.ts"
+  },
+  "dependencies": {
+    "@supabase/supabase-js": "2.106.2",
+    "hono": "^4.12.23",
+    "playwright-chromium": "^1.60.0"
+  },
+  "devDependencies": {
+    "@types/bun": "latest"
+  }
+}

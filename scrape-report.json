@@ -1,0 +1,11 @@
+{
+  "generatedAt": "2026-06-03T01:19:23.749Z",
+  "startedAt": "2026-06-03T01:18:37.117Z",
+  "finishedAt": "2026-06-03T01:19:23.749Z",
+  "durationMs": 46632,
+  "duration": "47s",
+  "totalHandles": 1,
+  "successfulHandles": 1,
+  "failedHandles": [],
+  "retryRounds": 1
+}

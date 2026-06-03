@@ -1,0 +1,7 @@
+# deps
+node_modules/
+.agents
+.env
+skills-*
+assets/*
+.DS_Store
