@@ -2,8 +2,11 @@ import { resolve } from "node:path";
 
 export const ASSETS_ROOT = resolve("assets");
 export const SCRAPE_REPORT_PATH = resolve("scrape-report.json");
+export const INSTAGRAM_STORAGE_STATE_PATH = resolve(
+  ".instagram-storage-state.json",
+);
 export const INSTAGRAM_ORIGIN = "https://www.instagram.com";
-export const MAX_POSTS_PER_HANDLE = 5;
+export const MAX_POSTS_PER_HANDLE = 6;
 export const ACTION_DELAY_MS = [2_500, 6_500] as const;
 export const POST_DELAY_MS = [8_000, 18_000] as const;
 export const ACCOUNT_DELAY_MS = [45_000, 95_000] as const;
@@ -12,7 +15,6 @@ export const NAVIGATION_TIMEOUT_MS = 45_000;
 export const DOWNLOAD_TIMEOUT_MS = 45_000;
 export const RETRIES_PER_POST = 2;
 export const MIN_VIDEO_BYTES = 100_000;
-export const MAX_MEDIA_PER_POST = 10;
 export const FAILED_HANDLE_RETRY_ROUNDS = 1;
 
 export const USER_AGENTS = [

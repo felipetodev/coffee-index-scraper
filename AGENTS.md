@@ -13,6 +13,8 @@
 - Failed/empty handles are retried once at the end and reported in root `scrape-report.json`.
 - API root `GET /` exposes scrape report timing: `startedAt`, `finishedAt`, `durationMs`, and `duration`.
 - Manifest field `images` can contain both images and videos; check `mediaType`.
+- Each manifest has up to 6 posts and each post has at most 1 item in `images`.
+- Each manifest post includes both `postUrl` and `directUrl`; keep them equal unless the schema is intentionally changed.
 - Do not print secrets from `.env`.
 
 ## Run Modes
@@ -28,10 +30,10 @@ bun dev
 Fast dev run for one Instagram, browser visible:
 
 ```sh
-bun run dev:ig -- --handle=@theelephantcoffeechile --posts=1
+bun run dev:ig -- --handle=@theelephantcoffeechile --posts=6
 ```
 
-`--posts` accepts `1` to `5`. Dev mode skips Supabase, forces `headless=false`, scrapes only that handle, and exits without starting the server.
+`--posts` accepts `1` to `6`. Dev mode skips Supabase, forces `headless=false`, scrapes only that handle, and exits without starting the server.
 
 Serve existing assets only:
 
@@ -92,14 +94,16 @@ Broken signs: `file` says `data`, `ffprobe` says `trex/trun`, or `xxd` starts wi
 
 ## Scraping Discipline
 
-- Concurrency must stay `1`: one account, one post, one media download at a time.
+- Concurrency must stay conservative: one account at a time, and never more than one video/reel page at a time.
 - Keep aggressive random delays between actions, posts, and accounts.
 - Rotate user agent and viewport per browser context.
 - No proxies are configured, so there is no real IP rotation.
 - Full runs log timestamps, duration per handle, progress, ETA, and final total time.
 - Treat `posts: []` or zero downloaded media as a scraping failure, not as a valid empty Instagram.
+- Do not traverse carousel slides. Download only the first representative asset for each of the latest 6 posts.
+- Prefer profile-grid images for image/carousel posts; open a post page only for video/reel MP4 capture or image fallback.
 - If changing media extraction, test first with:
 
 ```sh
-bun run dev:ig -- --handle=@theelephantcoffeechile --posts=1
+bun run dev:ig -- --handle=@theelephantcoffeechile --posts=6
 ```

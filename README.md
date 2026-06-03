@@ -39,10 +39,22 @@ Full scraping run:
 bun dev
 ```
 
+Full scraping run starting from one Instagram handle:
+
+```sh
+bun dev -- --start-from=@pausacafeteriacl
+```
+
 Debug one account with visible Chromium:
 
 ```sh
-bun run dev:ig -- --handle=@cafemagnolio.cl --posts=5
+bun run dev:ig -- --handle=@cafemagnolio.cl --posts=6
+```
+
+Open Instagram login only, solve any challenge manually, save the local session, and exit:
+
+```sh
+bun run dev:ig -- --login-only
 ```
 
 Serve existing assets:
@@ -59,11 +71,11 @@ bunx tsc --noEmit
 
 ## Outputs
 
-- `assets/<handle>/manifest.json`: downloaded posts and files.
+- `assets/<handle>/manifest.json`: downloaded posts and files. Each post includes `postUrl` and `directUrl` with the Instagram permalink.
 - `assets/<handle>/*`: downloaded images and videos.
 - `scrape-report.json`: batch summary, failures, start time, finish time, and duration.
 
-Each run replaces the previous assets for the scraped handle.
+Each run replaces the previous assets for the scraped handle. The scraper stores up to 6 recent posts per handle, with one asset per post. Carousels keep only their first representative image; reels/videos keep a downloaded MP4.
 
 ## API
 

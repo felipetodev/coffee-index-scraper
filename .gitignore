@@ -2,6 +2,7 @@
 node_modules/
 .agents
 .env
+.instagram-storage-state.json
 skills-*
 assets/*
 .DS_Store

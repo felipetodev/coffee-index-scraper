@@ -6,7 +6,7 @@ import {
   type Page,
   type Response,
 } from "playwright-chromium";
-import { mkdir, rename, rm, writeFile } from "node:fs/promises";
+import { mkdir, readFile, rename, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import {
   ACCOUNT_DELAY_MS,
@@ -15,8 +15,8 @@ import {
   DEV_POST_DELAY_MS,
   DOWNLOAD_TIMEOUT_MS,
   FAILED_HANDLE_RETRY_ROUNDS,
+  INSTAGRAM_STORAGE_STATE_PATH,
   INSTAGRAM_ORIGIN,
-  MAX_MEDIA_PER_POST,
   MAX_POSTS_PER_HANDLE,
   MIN_VIDEO_BYTES,
   NAVIGATION_TIMEOUT_MS,
@@ -32,6 +32,7 @@ import type {
   ManifestMedia,
   ManifestPost,
   MediaCandidate,
+  PostPreview,
   RuntimeConfig,
   ScrapeFailure,
   ScrapeFailureReason,
@@ -71,19 +72,26 @@ function requiredEnv(name: string): string {
 function loadConfig(): RuntimeConfig {
   const args = parseArgs();
   const devHandle = stringArg(args.handle) || Bun.env.DEV_HANDLE;
-  const devMode = Boolean(args.dev || devHandle || Bun.env.DEV_MODE === "1");
+  const startFromHandle =
+    stringArg(args["start-from"]) || Bun.env.START_FROM_HANDLE;
+  const loginOnly = Boolean(args["login-only"] || Bun.env.LOGIN_ONLY === "1");
+  const devMode = Boolean(
+    args.dev || devHandle || loginOnly || Bun.env.DEV_MODE === "1",
+  );
 
   return {
     instagramUsername: requiredEnv("IG_USERNAME"),
     instagramPassword: requiredEnv("IG_PASSWORD"),
-    supabaseUrl: requiredEnv("SUPABASE_URL"),
-    supabaseKey: requiredEnv("SUPABASE_SERVICE_ROLE_KEY"),
+    supabaseUrl: loginOnly ? "" : requiredEnv("SUPABASE_URL"),
+    supabaseKey: loginOnly ? "" : requiredEnv("SUPABASE_SERVICE_ROLE_KEY"),
     headless: devMode ? false : Bun.env.HEADLESS !== "0",
     devHandle,
+    startFromHandle,
     devPosts: clampPostLimit(
       Number(stringArg(args.posts) || Bun.env.DEV_POSTS || 1),
     ),
     devMode,
+    loginOnly,
   };
 }
 
@@ -123,6 +131,32 @@ async function fetchInstagramHandles(config: RuntimeConfig): Promise<string[]> {
 
   console.log(`[supabase] loaded ${handles.length} instagram handles`);
   return handles;
+}
+
+function sliceHandlesFromStart(
+  handles: string[],
+  startFromHandle?: string,
+): string[] {
+  if (!startFromHandle) {
+    return handles;
+  }
+
+  const normalizedStart = normalizeHandle(startFromHandle);
+  const startIndex = handles.findIndex(
+    (handle) => normalizeHandle(handle) === normalizedStart,
+  );
+
+  if (startIndex === -1) {
+    throw new Error(
+      `Start handle ${canonicalHandle(startFromHandle)} was not found in the Supabase handle list`,
+    );
+  }
+
+  const slicedHandles = handles.slice(startIndex);
+  console.log(
+    `[supabase] starting from ${canonicalHandle(startFromHandle)} at position ${startIndex + 1}/${handles.length}; ${slicedHandles.length} handle(s) remaining`,
+  );
+  return slicedHandles;
 }
 
 type InstagramStorageState = Awaited<
@@ -285,6 +319,7 @@ async function loginToInstagram(
   await page.waitForLoadState("domcontentloaded").catch(() => undefined);
   await rateLimit("after login submit", ACTION_DELAY_MS);
   await dismissInstagramOverlays(page);
+  await waitForInstagramSession(context, page, config);
 
   if (page.url().includes("/accounts/login")) {
     throw new Error(
@@ -293,69 +328,219 @@ async function loginToInstagram(
   }
 
   console.log("[instagram] login completed");
-  await page.close();
+  await saveInstagramStorageState(context);
+  await page.close().catch(() => undefined);
 }
 
-async function collectPostUrls(page: Page, handle: string): Promise<string[]> {
+async function waitForInstagramSession(
+  context: BrowserContext,
+  page: Page,
+  config: RuntimeConfig,
+): Promise<void> {
+  const deadline = Date.now() + (config.headless ? 20_000 : 180_000);
+  let recaptchaLogged = false;
+
+  while (Date.now() < deadline) {
+    const cookies = await context.cookies(INSTAGRAM_ORIGIN);
+    const hasSession = cookies.some(
+      (cookie) => cookie.name === "sessionid" && cookie.value,
+    );
+
+    if (hasSession) {
+      return;
+    }
+
+    if (page.url().includes("/auth_platform/recaptcha") && !recaptchaLogged) {
+      console.warn(
+        "[instagram] reCAPTCHA challenge detected. Waiting for manual completion in the visible browser.",
+      );
+      recaptchaLogged = true;
+    }
+
+    await sleep(1_000);
+  }
+
+  const diagnostics = await page
+    .evaluate(() => ({
+      url: window.location.href,
+      title: document.title,
+      bodyText: (document.body.textContent || "").slice(0, 500),
+    }))
+    .catch((error) => ({
+      error: error instanceof Error ? error.message : String(error),
+    }));
+
+  throw new Error(
+    `Instagram login did not create a session cookie. Diagnostics: ${JSON.stringify(diagnostics)}`,
+  );
+}
+
+async function loadInstagramStorageState(): Promise<
+  InstagramStorageState | undefined
+> {
+  try {
+    const state = JSON.parse(
+      await readFile(INSTAGRAM_STORAGE_STATE_PATH, "utf8"),
+    ) as InstagramStorageState;
+    console.log(`[instagram] loaded stored session from ${INSTAGRAM_STORAGE_STATE_PATH}`);
+    return state;
+  } catch {
+    return undefined;
+  }
+}
+
+async function saveInstagramStorageState(
+  context: BrowserContext,
+): Promise<void> {
+  const state = await context.storageState();
+  await writeFile(INSTAGRAM_STORAGE_STATE_PATH, JSON.stringify(state, null, 2));
+  console.log(`[instagram] saved session to ${INSTAGRAM_STORAGE_STATE_PATH}`);
+}
+
+async function contextHasInstagramSession(
+  context: BrowserContext,
+): Promise<boolean> {
+  const cookies = await context.cookies(INSTAGRAM_ORIGIN);
+  return cookies.some((cookie) => cookie.name === "sessionid" && cookie.value);
+}
+
+function isLoginRedirect(page: Page): boolean {
+  return page.url().includes("/accounts/login");
+}
+
+async function recoverProfileLoginRedirect(
+  page: Page,
+  config: RuntimeConfig,
+  profileUrl: string,
+  handle: string,
+): Promise<void> {
+  if (!isLoginRedirect(page)) {
+    return;
+  }
+
+  console.warn(
+    `[instagram] ${canonicalHandle(handle)} profile redirected to login; refreshing session once`,
+  );
+  await loginToInstagram(page.context(), config);
+  await rateLimit(
+    `after session refresh for ${canonicalHandle(handle)}`,
+    ACTION_DELAY_MS,
+  );
+  await page.goto(profileUrl, { waitUntil: "domcontentloaded" });
+  console.log(
+    `[instagram] ${canonicalHandle(handle)} profile reloaded after session refresh: ${page.url()}`,
+  );
+}
+
+async function collectProfilePostPreviews(
+  page: Page,
+  handle: string,
+  config: RuntimeConfig,
+): Promise<PostPreview[]> {
   const profileUrl = `${INSTAGRAM_ORIGIN}/${normalizeHandle(handle)}/`;
   console.log(`[instagram] visiting ${canonicalHandle(handle)} profile`);
   await page.goto(profileUrl, { waitUntil: "domcontentloaded" });
+  let refreshedSession = false;
+  if (isLoginRedirect(page)) {
+    await recoverProfileLoginRedirect(page, config, profileUrl, handle);
+    refreshedSession = true;
+  }
   await rateLimit(
     `profile ${canonicalHandle(handle)} settled`,
     ACTION_DELAY_MS,
   );
   await dismissInstagramOverlays(page);
+  if (isLoginRedirect(page)) {
+    if (refreshedSession) {
+      throw new Error(
+        `Instagram kept redirecting ${canonicalHandle(handle)} to login after session refresh`,
+      );
+    }
 
-  const postUrls = await page
+    await recoverProfileLoginRedirect(page, config, profileUrl, handle);
+  }
+
+  const previews = await page
     .locator('a[href*="/p/"], a[href*="/reel/"], a[href*="/reels/"]')
-    .evaluateAll((anchors) =>
-      anchors
-        .map((anchor) =>
-          anchor instanceof HTMLAnchorElement ? anchor.href : "",
-        )
-        .filter(Boolean),
+    .evaluateAll((anchors) => {
+      const seen = new Set<string>();
+      const previews: Array<{
+        postUrl: string;
+        isVideoLike: boolean;
+        imageCandidateUrl?: string;
+      }> = [];
+
+      for (const anchor of anchors) {
+        if (!(anchor instanceof HTMLAnchorElement)) {
+          continue;
+        }
+
+        const parsed = new URL(anchor.href);
+        const pathname = parsed.pathname;
+        if (!/\/(?:p|reel|reels)\/[A-Za-z0-9_-]+\/?$/.test(pathname)) {
+          continue;
+        }
+
+        const postUrl = `${parsed.origin}${pathname}`;
+        if (seen.has(postUrl)) {
+          continue;
+        }
+        seen.add(postUrl);
+
+        const image = anchor.querySelector("img");
+        const labels = Array.from(anchor.querySelectorAll("[aria-label]"))
+          .map((element) => element.getAttribute("aria-label") || "")
+          .join(" ")
+          .toLowerCase();
+        const isVideoLike =
+          /\/(?:reel|reels)\//.test(pathname) ||
+          labels.includes("reel") ||
+          labels.includes("clip") ||
+          labels.includes("video");
+
+        previews.push({
+          postUrl,
+          isVideoLike,
+          imageCandidateUrl: image?.currentSrc || image?.src || undefined,
+        });
+      }
+
+      return previews;
+    });
+
+  if (previews.length === 0) {
+    const diagnostics = await page
+      .evaluate(() => ({
+        url: window.location.href,
+        title: document.title,
+        bodyText: (document.body.textContent || "").slice(0, 500),
+        anchorCount: document.querySelectorAll("a").length,
+        imageCount: document.querySelectorAll("img").length,
+        dialogCount: document.querySelectorAll('[role="dialog"]').length,
+        hrefSamples: Array.from(document.querySelectorAll("a"))
+          .map((anchor) => anchor instanceof HTMLAnchorElement ? anchor.href : "")
+          .filter(Boolean)
+          .slice(0, 20),
+      }))
+      .catch((error) => ({
+        error: error instanceof Error ? error.message : String(error),
+      }));
+    console.warn(
+      `[instagram] ${canonicalHandle(handle)} profile yielded no post anchors. Diagnostics: ${JSON.stringify(diagnostics)}`,
     );
+  }
 
-  const normalizedUrls = unique(
-    postUrls
-      .map((url) => {
-        const parsed = new URL(url);
-        return `${parsed.origin}${parsed.pathname}`;
-      })
-      .filter((url) => {
-        const pathname = new URL(url).pathname;
-        return /\/(?:p|reel|reels)\/[A-Za-z0-9_-]+\/?$/.test(pathname);
-      }),
-  );
-
-  const selectedUrls = normalizedUrls.slice(0, MAX_POSTS_PER_HANDLE);
+  const selectedPreviews = previews.slice(0, MAX_POSTS_PER_HANDLE);
   console.log(
-    `[instagram] ${canonicalHandle(handle)} selected post urls: ${selectedUrls
-      .map((url, index) => `${index + 1}=${url}`)
+    `[instagram] ${canonicalHandle(handle)} selected post previews: ${selectedPreviews
+      .map(
+        (preview, index) =>
+          `${index + 1}=${preview.postUrl}:${preview.isVideoLike ? "video" : "image"}`,
+      )
       .join(" | ")}`,
   );
 
-  return selectedUrls;
-}
-
-function dedupeMediaCandidates(items: MediaCandidate[]): MediaCandidate[] {
-  const byKey = new Map<string, MediaCandidate>();
-
-  for (const item of items) {
-    const key = `${item.mediaType}:${item.sourceUrl}`;
-    const existing = byKey.get(key);
-    if (existing && (existing.sizeBytes || 0) >= (item.sizeBytes || 0)) {
-      continue;
-    }
-
-    byKey.set(key, item);
-  }
-
-  return [...byKey.values()];
-}
-
-function isBlobUrl(url: string): boolean {
-  return url.startsWith("blob:");
+  return selectedPreviews;
 }
 
 function looksLikeVideoUrl(url: string): boolean {
@@ -390,7 +575,9 @@ function isPlayableMp4(bytes: Uint8Array): boolean {
 
 async function transcodeVideoForQuickTime(filePath: string): Promise<void> {
   if (!(await hasVideoStream(filePath))) {
-    throw new Error(`downloaded MP4 has no video stream: ${await probeVideo(filePath)}`);
+    throw new Error(
+      `downloaded MP4 has no video stream: ${await probeVideo(filePath)}`,
+    );
   }
 
   const tempPath = `${filePath}.h264.tmp.mp4`;
@@ -507,65 +694,79 @@ async function encourageVideoLoad(page: Page): Promise<void> {
   await rateLimit("video load", ACTION_DELAY_MS);
 }
 
-async function extractScriptMedia(page: Page): Promise<MediaCandidate[]> {
-  return page
-    .evaluate(() => {
-      const media: Array<{ sourceUrl: string; mediaType: "image" | "video" }> =
-        [];
-      const scriptText = Array.from(document.querySelectorAll("script"))
-        .map((script) => script.textContent || "")
-        .join("\n");
-      const videoPatterns = [
-        /"video_url"\s*:\s*"([^"]+)"/g,
-        /"playable_url"\s*:\s*"([^"]+)"/g,
-        /"browser_native_hd_url"\s*:\s*"([^"]+)"/g,
-        /"browser_native_sd_url"\s*:\s*"([^"]+)"/g,
-      ];
-      const imagePatterns = [
-        /"display_url"\s*:\s*"([^"]+)"/g,
-        /"thumbnail_src"\s*:\s*"([^"]+)"/g,
-      ];
+async function waitForPostPage(page: Page, postUrl: string): Promise<void> {
+  const expectedPath = new URL(postUrl).pathname.replace(/\/$/, "");
 
-      for (const pattern of videoPatterns) {
-        for (const match of scriptText.matchAll(pattern)) {
-          const rawUrl = match[1];
-          if (rawUrl) {
-            media.push({
-              sourceUrl: decodeEscapedJsonUrl(rawUrl),
-              mediaType: "video",
-            });
-          }
-        }
-      }
+  await page
+    .waitForURL(
+      (currentUrl) => currentUrl.pathname.replace(/\/$/, "") === expectedPath,
+      { timeout: 8_000 },
+    )
+    .catch(() => undefined);
 
-      for (const pattern of imagePatterns) {
-        for (const match of scriptText.matchAll(pattern)) {
-          const rawUrl = match[1];
-          if (rawUrl) {
-            media.push({
-              sourceUrl: decodeEscapedJsonUrl(rawUrl),
-              mediaType: "image",
-            });
-          }
-        }
-      }
+  const hasVisibleMedia = await page
+    .locator(
+      '[role="dialog"] img, [role="dialog"] video, main img, main video, img, video',
+    )
+    .first()
+    .waitFor({ state: "visible", timeout: 8_000 })
+    .then(() => true)
+    .catch(() => false);
 
-      return media;
+  if (!hasVisibleMedia) {
+    const diagnostics = await page
+      .evaluate(() => ({
+        url: window.location.href,
+        title: document.title,
+        articleCount: document.querySelectorAll("article").length,
+        imageCount: document.querySelectorAll("img").length,
+        videoCount: document.querySelectorAll("video").length,
+        timeCount: document.querySelectorAll("time").length,
+        dialogCount: document.querySelectorAll('[role="dialog"]').length,
+      }))
+      .catch(() => null);
+    console.warn(
+      `[media-debug] post page media wait timed out: expected=${postUrl}, diagnostics=${JSON.stringify(diagnostics)}`,
+    );
+  }
 
-      function decodeEscapedJsonUrl(value: string): string {
-        return value
-          .replace(/\\u0026/g, "&")
-          .replace(/\\\//g, "/")
-          .replace(/\\\\/g, "\\");
-      }
-    })
-    .catch(() => []);
+  console.log(
+    `[media-debug] post page ready: expected=${postUrl}, current=${page.url()}`,
+  );
 }
 
-async function collectMediaUrlsFromPost(
+function chooseBestVideoCandidate(
+  candidates: MediaCandidate[],
+): MediaCandidate | null {
+  const deduped = new Map<string, MediaCandidate>();
+
+  for (const candidate of candidates) {
+    const previous = deduped.get(candidate.sourceUrl);
+    if (
+      !previous ||
+      Number(Boolean(candidate.dataBase64)) > Number(Boolean(previous.dataBase64)) ||
+      (candidate.sizeBytes || 0) > (previous.sizeBytes || 0)
+    ) {
+      deduped.set(candidate.sourceUrl, candidate);
+    }
+  }
+
+  return (
+    [...deduped.values()].sort((left, right) => {
+      const leftHasBody = left.dataBase64 ? 1 : 0;
+      const rightHasBody = right.dataBase64 ? 1 : 0;
+      return (
+        rightHasBody - leftHasBody ||
+        (right.sizeBytes || 0) - (left.sizeBytes || 0)
+      );
+    })[0] || null
+  );
+}
+
+async function collectVideoFromPostPage(
   page: Page,
   postUrl: string,
-): Promise<MediaCandidate[]> {
+): Promise<MediaCandidate | null> {
   const networkMedia: MediaCandidate[] = [];
   const onResponse = async (response: Response) => {
     const sourceUrl = response.url();
@@ -615,161 +816,86 @@ async function collectMediaUrlsFromPost(
 
   page.on("response", onResponse);
 
-  await page.goto(postUrl, { waitUntil: "domcontentloaded" });
-  await rateLimit("post settled", ACTION_DELAY_MS);
-  await dismissInstagramOverlays(page);
-  await encourageVideoLoad(page);
-
-  const mediaCandidates: MediaCandidate[] = await extractScriptMedia(page);
-
   try {
-    for (let slide = 0; slide < 12; slide += 1) {
-      const currentMedia = await page.evaluate(async () => {
-        const article = document.querySelector("article");
-        const images = Array.from(
-          (article || document).querySelectorAll("img"),
-        );
-        const videos = Array.from(
-          (article || document).querySelectorAll("video"),
-        );
-        const isLargeVisible = (element: Element) => {
-          const rect = element.getBoundingClientRect();
-          return (
-            rect.width >= 240 &&
-            rect.height >= 240 &&
-            rect.bottom > 0 &&
-            rect.right > 0 &&
-            rect.top < window.innerHeight &&
-            rect.left < window.innerWidth
-          );
-        };
-
-        const videoMedia = await Promise.all(
-          videos
-            .filter(isLargeVisible)
-            .flatMap((video) => {
-              const sourceUrls = Array.from(video.querySelectorAll("source"))
-                .map((source) => source.src)
-                .filter(Boolean);
-              const directUrl = video.currentSrc || video.src;
-              return [directUrl, ...sourceUrls].filter(Boolean);
-            })
-            .map(async (sourceUrl) => {
-              if (!sourceUrl.startsWith("blob:")) {
-                return {
-                  sourceUrl,
-                  mediaType: "video" as const,
-                };
-              }
-
-              try {
-                const response = await fetch(sourceUrl);
-                const blob = await response.blob();
-                const bytes = new Uint8Array(await blob.arrayBuffer());
-                let binary = "";
-                const chunkSize = 0x8000;
-
-                for (
-                  let offset = 0;
-                  offset < bytes.length;
-                  offset += chunkSize
-                ) {
-                  binary += String.fromCharCode(
-                    ...bytes.subarray(offset, offset + chunkSize),
-                  );
-                }
-
-                return {
-                  sourceUrl,
-                  mediaType: "video" as const,
-                  contentType: blob.type || "video/mp4",
-                  dataBase64: btoa(binary),
-                  sizeBytes: bytes.byteLength,
-                };
-              } catch {
-                return {
-                  sourceUrl,
-                  mediaType: "video" as const,
-                };
-              }
-            }),
-        );
-
-        const imageMedia =
-          videoMedia.length > 0
-            ? []
-            : images
-                .filter(isLargeVisible)
-                .map((image) => {
-                  const alt = imageAlt(image);
-                  return {
-                    sourceUrl: image.currentSrc || image.src,
-                    alt,
-                  };
-                })
-                .filter(({ sourceUrl, alt }) => {
-                  if (!sourceUrl) return false;
-                  return (
-                    !alt.includes("profile picture") &&
-                    !alt.includes("foto del perfil")
-                  );
-                })
-                .map(({ sourceUrl }) => ({
-                  sourceUrl,
-                  mediaType: "image" as const,
-                }));
-
-        return [...videoMedia, ...imageMedia];
-
-        function imageAlt(image: HTMLImageElement): string {
-          return (image.getAttribute("alt") || "").toLowerCase();
-        }
-      });
-
-      mediaCandidates.push(
-        ...currentMedia.filter(
-          (media) =>
-            isBlobUrl(media.sourceUrl) ||
-            looksLikeInstagramMedia(media.sourceUrl),
-        ),
-      );
-
-      const nextButton = page
-        .locator('button[aria-label="Next"], button[aria-label="Siguiente"]')
-        .last();
-
-      if (!(await nextButton.isVisible().catch(() => false))) {
-        break;
-      }
-
-      await nextButton.click({ timeout: 5_000 }).catch(() => undefined);
-      await rateLimit("carousel next", ACTION_DELAY_MS);
-      await encourageVideoLoad(page);
-    }
+    await page.goto("about:blank", { waitUntil: "domcontentloaded" });
+    await page.goto(postUrl, { waitUntil: "domcontentloaded" });
+    await rateLimit("post settled", ACTION_DELAY_MS);
+    await dismissInstagramOverlays(page);
+    await waitForPostPage(page, postUrl);
+    await encourageVideoLoad(page);
+    await sleep(1_500);
   } finally {
     page.off("response", onResponse);
   }
 
-  const downloadedBlobMedia = mediaCandidates.filter(
-    (media) =>
-      !isBlobUrl(media.sourceUrl) ||
-      (media.dataBase64 && (media.sizeBytes || 0) >= MIN_VIDEO_BYTES),
+  const selected = chooseBestVideoCandidate(networkMedia);
+  console.log(
+    `[media-debug] post video candidates: post=${postUrl}, count=${networkMedia.length}, selected=${selected?.sourceUrl || "none"}`,
   );
-  const largestNetworkVideo = networkMedia
-    .sort((left, right) => {
-      const leftHasBody = left.dataBase64 ? 1 : 0;
-      const rightHasBody = right.dataBase64 ? 1 : 0;
+  return selected;
+}
+
+async function selectPrimaryImageFromPostPage(
+  page: Page,
+  postUrl: string,
+): Promise<string | null> {
+  await page.goto("about:blank", { waitUntil: "domcontentloaded" });
+  await page.goto(postUrl, { waitUntil: "domcontentloaded" });
+  await rateLimit("post image fallback settled", ACTION_DELAY_MS);
+  await dismissInstagramOverlays(page);
+  await waitForPostPage(page, postUrl);
+
+  return page
+    .evaluate(() => {
+      const viewportCenterX = window.innerWidth / 2;
+      const viewportCenterY = window.innerHeight / 2;
+      const images = Array.from(
+        document.querySelectorAll<HTMLImageElement>(
+          '[role="dialog"] article img, main article img, article img, main img',
+        ),
+      );
+
       return (
-        rightHasBody - leftHasBody ||
-        (right.sizeBytes || 0) - (left.sizeBytes || 0)
+        images
+          .map((image) => {
+            const rect = image.getBoundingClientRect();
+            const sourceUrl = image.currentSrc || image.src;
+            const alt = (image.getAttribute("alt") || "").toLowerCase();
+            const centerX = rect.left + rect.width / 2;
+            const centerY = rect.top + rect.height / 2;
+
+            return {
+              sourceUrl,
+              alt,
+              area: rect.width * rect.height,
+              visible:
+                rect.width >= 220 &&
+                rect.height >= 220 &&
+                rect.bottom > 0 &&
+                rect.right > 0 &&
+                rect.top < window.innerHeight &&
+                rect.left < window.innerWidth,
+              distanceFromCenter: Math.hypot(
+                centerX - viewportCenterX,
+                centerY - viewportCenterY,
+              ),
+            };
+          })
+          .filter(
+            ({ sourceUrl, alt, visible }) =>
+              visible &&
+              Boolean(sourceUrl) &&
+              !alt.includes("profile picture") &&
+              !alt.includes("foto del perfil"),
+          )
+          .sort(
+            (left, right) =>
+              right.area - left.area ||
+              left.distanceFromCenter - right.distanceFromCenter,
+          )[0]?.sourceUrl || null
       );
     })
-    .slice(0, 1);
-
-  return dedupeMediaCandidates([
-    ...downloadedBlobMedia,
-    ...largestNetworkVideo,
-  ]).slice(0, MAX_MEDIA_PER_POST);
+    .catch(() => null);
 }
 
 async function downloadMedia(
@@ -835,8 +961,8 @@ async function downloadMedia(
 }
 
 async function scrapePostWithRetries(
-  page: Page,
-  postUrl: string,
+  context: BrowserContext,
+  preview: PostPreview,
   targetDir: string,
   handle: string,
   postIndex: number,
@@ -846,51 +972,23 @@ async function scrapePostWithRetries(
       console.log(
         `[instagram] ${canonicalHandle(handle)} post ${postIndex + 1}: scraping attempt ${attempt}`,
       );
-      const mediaItems = await collectMediaUrlsFromPost(page, postUrl);
-      console.log(
-        `[instagram] ${canonicalHandle(handle)} post ${postIndex + 1}: found ${mediaItems.length} media candidates (${mediaItems.filter((media) => media.mediaType === "video").length} videos)`,
+      const image = await scrapeSingleAssetForPost(
+        context,
+        preview,
+        targetDir,
+        handle,
+        postIndex,
       );
-      const images: ManifestMedia[] = [];
-      const mediaErrors: string[] = [];
-
-      for (
-        let mediaIndex = 0;
-        mediaIndex < mediaItems.length;
-        mediaIndex += 1
-      ) {
-        try {
-          images.push(
-            await downloadMedia(
-              mediaItems[mediaIndex]!,
-              targetDir,
-              handle,
-              postIndex,
-              mediaIndex,
-            ),
-          );
-        } catch (error) {
-          const message = error instanceof Error ? error.message : String(error);
-          mediaErrors.push(`candidate ${mediaIndex + 1}: ${message}`);
-          console.warn(
-            `[instagram] ${canonicalHandle(handle)} post ${postIndex + 1} media candidate ${mediaIndex + 1} failed: ${message}`,
-          );
-        }
-        if (images.length > 0) {
-          await rateLimit("between media downloads", ACTION_DELAY_MS);
-        }
-      }
-
-      if (mediaItems.length > 0 && images.length === 0) {
-        throw new Error(
-          `all media candidates failed: ${mediaErrors.join(" | ") || "unknown"}`,
-        );
-      }
+      console.log(
+        `[instagram] ${canonicalHandle(handle)} post ${postIndex + 1}: downloaded ${image.mediaType} ${image.fileName}`,
+      );
 
       return {
-        postUrl,
-        images,
+        postUrl: preview.postUrl,
+        directUrl: preview.postUrl,
+        images: [image],
         downloadedAt: new Date().toISOString(),
-        status: images.length > 0 ? "ok" : "empty",
+        status: "ok",
       };
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
@@ -901,7 +999,8 @@ async function scrapePostWithRetries(
         await rateLimit("before post retry", POST_DELAY_MS);
       } else {
         return {
-          postUrl,
+          postUrl: preview.postUrl,
+          directUrl: preview.postUrl,
           images: [],
           downloadedAt: new Date().toISOString(),
           status: "failed",
@@ -912,12 +1011,91 @@ async function scrapePostWithRetries(
   }
 
   return {
-    postUrl,
+    postUrl: preview.postUrl,
+    directUrl: preview.postUrl,
     images: [],
     downloadedAt: new Date().toISOString(),
     status: "failed",
     error: "Unexpected retry loop exit",
   };
+}
+
+async function scrapeSingleAssetForPost(
+  context: BrowserContext,
+  preview: PostPreview,
+  targetDir: string,
+  handle: string,
+  postIndex: number,
+): Promise<ManifestMedia> {
+  if (preview.isVideoLike) {
+    const page = await context.newPage();
+    try {
+      const videoCandidate = await collectVideoFromPostPage(
+        page,
+        preview.postUrl,
+      );
+      if (!videoCandidate) {
+        throw new Error("No playable video candidate was detected from network");
+      }
+
+      console.log(
+        `[media-debug] post ${postIndex + 1}: asset=${videoCandidate.sourceUrl}, mediaType=video, source=post-page-video`,
+      );
+      return downloadMedia(videoCandidate, targetDir, handle, postIndex, 0);
+    } finally {
+      await page.close().catch(() => undefined);
+    }
+  }
+
+  if (
+    preview.imageCandidateUrl &&
+    looksLikeInstagramMedia(preview.imageCandidateUrl)
+  ) {
+    console.log(
+      `[media-debug] post ${postIndex + 1}: asset=${preview.imageCandidateUrl}, mediaType=image, source=profile-grid`,
+    );
+    try {
+      return await downloadMedia(
+        {
+          sourceUrl: preview.imageCandidateUrl,
+          mediaType: "image",
+        },
+        targetDir,
+        handle,
+        postIndex,
+        0,
+      );
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      console.warn(
+        `[media-debug] post ${postIndex + 1}: profile-grid image failed, using post fallback: ${message}`,
+      );
+    }
+  }
+
+  const page = await context.newPage();
+  try {
+    const imageUrl = await selectPrimaryImageFromPostPage(page, preview.postUrl);
+    if (!imageUrl || !looksLikeInstagramMedia(imageUrl)) {
+      throw new Error("No primary image candidate was detected from post page");
+    }
+
+    console.log(
+      `[media-debug] post ${postIndex + 1}: asset=${imageUrl}, mediaType=image, source=post-page-image-fallback`,
+    );
+    return downloadMedia(
+      {
+        sourceUrl: imageUrl,
+        mediaType: "image",
+      },
+      targetDir,
+      handle,
+      postIndex,
+      0,
+    );
+  } finally {
+    await page.close().catch(() => undefined);
+  }
 }
 
 async function prepareHandleDir(handle: string): Promise<string> {
@@ -980,6 +1158,7 @@ async function writeScrapeReport(
 
 async function scrapeAndTrackHandle(
   browser: Browser,
+  config: RuntimeConfig,
   handle: string,
   storageState: InstagramStorageState,
   postLimit: number,
@@ -991,6 +1170,7 @@ async function scrapeAndTrackHandle(
   try {
     const manifest = await scrapeHandleWithState(
       browser,
+      config,
       handle,
       storageState,
       postLimit,
@@ -1039,7 +1219,10 @@ async function scrapeAll(config: RuntimeConfig): Promise<void> {
 
   const handles = config.devHandle
     ? [normalizeHandle(config.devHandle)]
-    : await fetchInstagramHandles(config);
+    : sliceHandlesFromStart(
+        await fetchInstagramHandles(config),
+        config.startFromHandle,
+      );
   if (handles.length === 0) {
     console.log("[supabase] no instagram handles found; skipping scraping");
     return;
@@ -1051,8 +1234,15 @@ async function scrapeAll(config: RuntimeConfig): Promise<void> {
   });
 
   try {
-    const loginContext = await createInstagramContext(browser);
-    await loginToInstagram(loginContext, config);
+    const loginContext = await createInstagramContext(
+      browser,
+      await loadInstagramStorageState(),
+    );
+    if (await contextHasInstagramSession(loginContext)) {
+      console.log("[instagram] using stored session");
+    } else {
+      await loginToInstagram(loginContext, config);
+    }
     const storageState = await loginContext.storageState();
     await loginContext.close();
     const scrapeStartedAt = timestamp();
@@ -1075,6 +1265,7 @@ async function scrapeAll(config: RuntimeConfig): Promise<void> {
       );
       await scrapeAndTrackHandle(
         browser,
+        config,
         handle,
         storageState,
         postLimit,
@@ -1129,6 +1320,7 @@ async function scrapeAll(config: RuntimeConfig): Promise<void> {
         );
         await scrapeAndTrackHandle(
           browser,
+          config,
           handle,
           storageState,
           postLimit,
@@ -1173,26 +1365,30 @@ async function scrapeAll(config: RuntimeConfig): Promise<void> {
 
 async function scrapeHandleWithState(
   browser: Browser,
+  config: RuntimeConfig,
   handle: string,
   storageState: InstagramStorageState,
   postLimit = MAX_POSTS_PER_HANDLE,
 ): Promise<Manifest> {
   const context = await createInstagramContext(browser, storageState);
-  const page = await context.newPage();
+  const profilePage = await context.newPage();
 
   try {
     const targetDir = await prepareHandleDir(handle);
-    const postUrls = (await collectPostUrls(page, handle)).slice(0, postLimit);
+    const postPreviews = (
+      await collectProfilePostPreviews(profilePage, handle, config)
+    ).slice(0, postLimit);
     console.log(
-      `[instagram] ${canonicalHandle(handle)} found ${postUrls.length} recent posts`,
+      `[instagram] ${canonicalHandle(handle)} found ${postPreviews.length} recent posts`,
     );
+    await profilePage.close().catch(() => undefined);
 
     const posts: ManifestPost[] = [];
-    for (let postIndex = 0; postIndex < postUrls.length; postIndex += 1) {
+    for (let postIndex = 0; postIndex < postPreviews.length; postIndex += 1) {
       posts.push(
         await scrapePostWithRetries(
-          page,
-          postUrls[postIndex]!,
+          context,
+          postPreviews[postIndex]!,
           targetDir,
           handle,
           postIndex,
@@ -1216,13 +1412,38 @@ async function scrapeHandleWithState(
     );
     return manifest;
   } finally {
-    await page.close().catch(() => undefined);
+    await profilePage.close().catch(() => undefined);
     await context.close().catch(() => undefined);
   }
 }
 
 async function main(): Promise<void> {
   const config = loadConfig();
+
+  if (config.loginOnly) {
+    const browser = await chromium.launch({
+      headless: false,
+      slowMo: 150,
+    });
+
+    try {
+      const context = await createInstagramContext(
+        browser,
+        await loadInstagramStorageState(),
+      );
+      if (await contextHasInstagramSession(context)) {
+        console.log("[instagram] stored session is already valid");
+        await saveInstagramStorageState(context);
+      } else {
+        await loginToInstagram(context, config);
+      }
+      await context.close().catch(() => undefined);
+      console.log("[dev] login-only done");
+    } finally {
+      await browser.close().catch(() => undefined);
+    }
+    return;
+  }
 
   if (config.devMode) {
     if (!config.devHandle) {

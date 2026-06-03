@@ -13,6 +13,7 @@ export type ManifestMedia = {
 
 export type ManifestPost = {
   postUrl: string;
+  directUrl: string;
   images: ManifestMedia[];
   downloadedAt: string;
   status: "ok" | "empty" | "failed";
@@ -32,8 +33,10 @@ export type RuntimeConfig = {
   supabaseKey: string;
   headless: boolean;
   devHandle?: string;
+  startFromHandle?: string;
   devPosts: number;
   devMode: boolean;
+  loginOnly: boolean;
 };
 
 export type MediaCandidate = {
@@ -42,6 +45,12 @@ export type MediaCandidate = {
   contentType?: string;
   dataBase64?: string;
   sizeBytes?: number;
+};
+
+export type PostPreview = {
+  postUrl: string;
+  isVideoLike: boolean;
+  imageCandidateUrl?: string;
 };
 
 export type ScrapeFailureReason =
