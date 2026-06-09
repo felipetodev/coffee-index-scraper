@@ -3,19 +3,29 @@
 ## Core Rules
 
 - `src/index.ts` is scraper-only. Do not add API/server code there.
-- API/server code lives in `src/api/`.
+- API/server code lives in `src/api/`; `src/api/index.ts` is the Cloudflare Worker export and `src/api/dev.ts` is the Bun local server.
+- InsForge backup API lives in `src/api/backup-api.ts`; `src/api/backup-dev.ts` is its Bun local server.
 - Shared app types live in `src/types.ts`; import them type-only across modules.
 - Shared constants live in `src/constants.ts`; shared pure helpers live in `src/utils.ts`.
 - Use Bun. Verify with `bunx tsc --noEmit`.
 - Supabase is read-only: do not delete rows, write rows, or create migrations.
 - Query only `cafe_social_links`, select `handle, platform`, filter `platform = "instagram"`.
 - Assets live in `assets/<handle>/`; each run replaces that handle's folder.
+- Convex is used only for file storage plus an asset mapping table, not for hosting this API.
+- Convex asset keys are `<handle>-post-01`, `<handle>-post-02`, etc., without `@`.
+- Runtime code only needs `CONVEX_URL`; `CONVEX_DEPLOYMENT` is CLI-managed and `CONVEX_SITE_URL` is not used by this app.
+- Cloudflare config lives in `wrangler.toml`; never put `CONVEX_URL` there. Use `wrangler secret put CONVEX_URL`.
 - Failed/empty handles are retried once at the end and reported in root `scrape-report.json`.
-- API root `GET /` exposes scrape report timing: `startedAt`, `finishedAt`, `durationMs`, and `duration`.
+- API root `GET /` exposes status/endpoints only.
+- API `GET /assets/:handle` reads Convex only and returns a flat list of `{ type, url, postUrl }`.
+- Backup API `GET /assets/:handle` reads InsForge `cafe_media` and returns `{ type, url, postUrl }`.
+- `bun run sync:insforge-all` is intentionally destructive: delete/recreate InsForge `assets`, clear `cafe_media`, upload local assets, then repopulate metadata.
+- API `GET /assets/:handle` uses Hono cache middleware: browser max-age 5m, Cloudflare edge s-maxage 1h, stale-while-revalidate 24h.
 - Manifest field `images` can contain both images and videos; check `mediaType`.
 - Each manifest has up to 6 posts and each post has at most 1 item in `images`.
 - Each manifest post includes both `postUrl` and `directUrl`; keep them equal unless the schema is intentionally changed.
 - Do not print secrets from `.env`.
+- Default logs should stay compact. Use `VERBOSE_LOGS=1` for rate-limit, media URL, and Convex upload debug logs.
 
 ## Run Modes
 
@@ -39,6 +49,18 @@ Serve existing assets only:
 
 ```sh
 bun run api
+```
+
+Sync local assets to Convex Storage:
+
+```sh
+bun run sync:convex
+```
+
+Sync one handle for testing:
+
+```sh
+bun run sync:convex -- --handle=@cafetriciclo
 ```
 
 ## Critical Instagram DOM Details
@@ -107,3 +129,24 @@ Broken signs: `file` says `data`, `ffprobe` says `trex/trun`, or `xxd` starts wi
 ```sh
 bun run dev:ig -- --handle=@theelephantcoffeechile --posts=6
 ```
+
+<!-- INSFORGE:START -->
+## InsForge backend
+
+This project uses [InsForge](https://insforge.dev): an all-in-one, open-source Postgres-based backend (BaaS) that gives this app a database, authentication, file storage, edge functions, realtime, an AI model gateway, and payments through one platform.
+
+- **Project:** **coffee-index** (API base `https://anvb3sqr.us-east.insforge.app`)
+- **Skills:** these InsForge skills are installed for supported coding agents. Reach for them before implementing any InsForge feature instead of guessing the API:
+  - `insforge`: app code with the `@insforge/sdk` client (database CRUD, auth, storage, edge functions, realtime, AI, email, and Stripe payments).
+  - `insforge-cli`: backend and infrastructure via the `insforge` CLI (projects, SQL, migrations, RLS policies, storage buckets, functions, secrets, payment setup, schedules, deploys).
+  - `insforge-debug`: diagnosing failures (SDK/HTTP errors, RLS denials, auth and OAuth issues) and running security or performance audits.
+  - `insforge-integrations`: wiring external auth providers (Clerk, Auth0, WorkOS, Better Auth, etc.) for JWT-based RLS, or the OKX x402 payment facilitator.
+  - `find-skills`: discovering additional skills on demand.
+- **Credentials:** app code reads keys from `.env.local`; the CLI reads `.insforge/project.json`. Never hardcode or commit keys.
+
+Key patterns:
+
+- Database inserts take an array: `insert([{ ... }])`.
+- Reference users with `auth.users(id)`; use `auth.uid()` in RLS policies.
+- For storage uploads, persist both the returned `url` and `key`.
+<!-- INSFORGE:END -->

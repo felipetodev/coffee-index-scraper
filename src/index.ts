@@ -60,6 +60,15 @@ import {
   unique,
 } from "./utils";
 
+const VERBOSE_LOGS =
+  Bun.env.VERBOSE_LOGS === "1" || Bun.env.DEBUG_LOGS === "1";
+
+function verboseLog(message: string): void {
+  if (VERBOSE_LOGS) {
+    console.log(message);
+  }
+}
+
 function requiredEnv(name: string): string {
   const value = Bun.env[name];
   if (!value) {
@@ -100,7 +109,7 @@ async function rateLimit(
   range: readonly [number, number],
 ): Promise<void> {
   const ms = randomBetween(range);
-  console.log(`[rate-limit] ${label}: waiting ${Math.round(ms / 1000)}s`);
+  verboseLog(`[rate-limit] ${label}: waiting ${Math.round(ms / 1000)}s`);
   await sleep(ms);
 }
 
@@ -526,13 +535,22 @@ async function collectProfilePostPreviews(
         error: error instanceof Error ? error.message : String(error),
       }));
     console.warn(
-      `[instagram] ${canonicalHandle(handle)} profile yielded no post anchors. Diagnostics: ${JSON.stringify(diagnostics)}`,
+      `[instagram] ${canonicalHandle(handle)} profile yielded no post anchors`,
+    );
+    verboseLog(
+      `[instagram-debug] ${canonicalHandle(handle)} no-anchor diagnostics: ${JSON.stringify(diagnostics)}`,
     );
   }
 
   const selectedPreviews = previews.slice(0, MAX_POSTS_PER_HANDLE);
+  const videoPreviews = selectedPreviews.filter(
+    (preview) => preview.isVideoLike,
+  ).length;
   console.log(
-    `[instagram] ${canonicalHandle(handle)} selected post previews: ${selectedPreviews
+    `[instagram] ${canonicalHandle(handle)} selected ${selectedPreviews.length} post(s): ${selectedPreviews.length - videoPreviews} image, ${videoPreviews} video`,
+  );
+  verboseLog(
+    `[instagram-debug] ${canonicalHandle(handle)} selected previews: ${selectedPreviews
       .map(
         (preview, index) =>
           `${index + 1}=${preview.postUrl}:${preview.isVideoLike ? "video" : "image"}`,
@@ -725,12 +743,13 @@ async function waitForPostPage(page: Page, postUrl: string): Promise<void> {
         dialogCount: document.querySelectorAll('[role="dialog"]').length,
       }))
       .catch(() => null);
-    console.warn(
+    console.warn("[media] post page media wait timed out");
+    verboseLog(
       `[media-debug] post page media wait timed out: expected=${postUrl}, diagnostics=${JSON.stringify(diagnostics)}`,
     );
   }
 
-  console.log(
+  verboseLog(
     `[media-debug] post page ready: expected=${postUrl}, current=${page.url()}`,
   );
 }
@@ -829,8 +848,8 @@ async function collectVideoFromPostPage(
   }
 
   const selected = chooseBestVideoCandidate(networkMedia);
-  console.log(
-    `[media-debug] post video candidates: post=${postUrl}, count=${networkMedia.length}, selected=${selected?.sourceUrl || "none"}`,
+  verboseLog(
+    `[media-debug] post video candidates: post=${postUrl}, count=${networkMedia.length}, selected=${selected ? "yes" : "no"}`,
   );
   return selected;
 }
@@ -945,8 +964,9 @@ async function downloadMedia(
   await writeFile(filePath, bytes);
 
   if (media.mediaType === "video") {
+    const sizeMb = (bytes.byteLength / 1024 / 1024).toFixed(2);
     console.log(
-      `[media] transcode ${fileName}: bytes=${bytes.byteLength}, contentType=${contentType || "unknown"}, sourceUrl=${sourceUrl}`,
+      `[media] transcode ${fileName}: ${sizeMb}MB, contentType=${contentType || "unknown"}`,
     );
     await transcodeVideoForQuickTime(filePath);
   }
@@ -1038,7 +1058,7 @@ async function scrapeSingleAssetForPost(
         throw new Error("No playable video candidate was detected from network");
       }
 
-      console.log(
+      verboseLog(
         `[media-debug] post ${postIndex + 1}: asset=${videoCandidate.sourceUrl}, mediaType=video, source=post-page-video`,
       );
       return downloadMedia(videoCandidate, targetDir, handle, postIndex, 0);
@@ -1051,7 +1071,7 @@ async function scrapeSingleAssetForPost(
     preview.imageCandidateUrl &&
     looksLikeInstagramMedia(preview.imageCandidateUrl)
   ) {
-    console.log(
+    verboseLog(
       `[media-debug] post ${postIndex + 1}: asset=${preview.imageCandidateUrl}, mediaType=image, source=profile-grid`,
     );
     try {
@@ -1067,7 +1087,7 @@ async function scrapeSingleAssetForPost(
       );
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
-      console.warn(
+      verboseLog(
         `[media-debug] post ${postIndex + 1}: profile-grid image failed, using post fallback: ${message}`,
       );
     }
@@ -1080,7 +1100,7 @@ async function scrapeSingleAssetForPost(
       throw new Error("No primary image candidate was detected from post page");
     }
 
-    console.log(
+    verboseLog(
       `[media-debug] post ${postIndex + 1}: asset=${imageUrl}, mediaType=image, source=post-page-image-fallback`,
     );
     return downloadMedia(

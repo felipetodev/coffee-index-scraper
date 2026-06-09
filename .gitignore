@@ -2,7 +2,23 @@
 node_modules/
 .agents
 .env
+.env.local
+.dev.vars
 .instagram-storage-state.json
 skills-*
 assets/*
 .DS_Store
+
+# InsForge & AI agent skills
+.insforge
+.agent
+.augment
+.claude
+.cline
+.github/copilot*
+.kilocode
+.qoder
+.qwen
+.roo
+.trae
+.windsurf

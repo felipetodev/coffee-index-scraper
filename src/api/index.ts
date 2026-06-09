@@ -1,129 +1,107 @@
 import { Hono } from "hono";
-import { existsSync } from "node:fs";
-import { readdir, readFile, stat } from "node:fs/promises";
-import { basename, join } from "node:path";
-import { ASSETS_ROOT, SCRAPE_REPORT_PATH } from "../constants";
-import type { Manifest, ScrapeReport } from "../types";
-import {
-  canonicalHandle,
-  fileUrlFor,
-  formatDuration,
-  handleAssetsDir,
-} from "../utils";
+import { cache } from "hono/cache";
+import { cors } from "hono/cors";
+import { ConvexHttpClient } from "convex/browser";
+import { api } from "../../convex/_generated/api";
 
-async function readManifest(handle: string): Promise<Manifest | null> {
-  const manifestPath = join(handleAssetsDir(handle), "manifest.json");
-  if (!existsSync(manifestPath)) {
-    return null;
-  }
+type ApiEnv = {
+  Bindings: {
+    CONVEX_URL?: string;
+  };
+};
 
-  return JSON.parse(await readFile(manifestPath, "utf8")) as Manifest;
+const ALLOWED_ORIGINS = new Set([
+  "http://localhost:3000",
+  "https://dev-coffeeindex.vercel.app",
+  "https://coffeeindex.vercel.app",
+]);
+const ASSETS_CACHE_CONTROL =
+  "public, max-age=300, s-maxage=3600, stale-while-revalidate=86400";
+
+function normalizeOrigin(origin: string): string {
+  return origin.replace(/\/+$/, "");
 }
 
-async function readScrapeReport(): Promise<ScrapeReport | null> {
-  if (!existsSync(SCRAPE_REPORT_PATH)) {
-    return null;
-  }
-
-  return JSON.parse(await readFile(SCRAPE_REPORT_PATH, "utf8")) as ScrapeReport;
+function createConvexClient(convexUrl?: string): ConvexHttpClient | null {
+  return convexUrl ? new ConvexHttpClient(convexUrl) : null;
 }
 
-async function listExistingAssetHandles(): Promise<string[]> {
-  if (!existsSync(ASSETS_ROOT)) {
-    return [];
-  }
+export function createApp(convexUrl?: string): Hono<ApiEnv> {
+  const app = new Hono<ApiEnv>();
+  const staticConvex = createConvexClient(convexUrl);
 
-  const entries = await readdir(ASSETS_ROOT, { withFileTypes: true });
-  return entries
-    .filter((entry) => entry.isDirectory())
-    .map((entry) => entry.name);
-}
+  app.use("*", async (c, next) => {
+    const origin = c.req.header("origin");
+    if (origin && !ALLOWED_ORIGINS.has(normalizeOrigin(origin))) {
+      return c.json({ error: "Origin not allowed" }, 403);
+    }
 
-function createApp(): Hono {
-  const app = new Hono();
+    await next();
+  });
 
-  app.get("/", async (c) => {
-    const report = await readScrapeReport().catch((error) => {
-      console.warn("[server] failed to read scrape report:", error);
-      return null;
-    });
+  app.use(
+    "*",
+    cors({
+      origin: (origin) => {
+        const normalizedOrigin = normalizeOrigin(origin);
+        return ALLOWED_ORIGINS.has(normalizedOrigin) ? normalizedOrigin : null;
+      },
+      allowMethods: ["GET", "OPTIONS"],
+      allowHeaders: ["Content-Type"],
+      maxAge: 86_400,
+    }),
+  );
 
-    return c.json({
+  app.get("/", (c) =>
+    c.json({
       ok: true,
-      endpoints: ["/assets/:handle", "/files/:handle/:filename"],
-      scrape: report
-        ? {
-            generatedAt: report.generatedAt,
-            startedAt: report.startedAt || null,
-            finishedAt: report.finishedAt || null,
-            durationMs: report.durationMs ?? null,
-            duration:
-              report.duration ||
-              (typeof report.durationMs === "number"
-                ? formatDuration(report.durationMs)
-                : null),
-            totalHandles: report.totalHandles,
-            successfulHandles: report.successfulHandles,
-            failedHandles: report.failedHandles.length,
-            retryRounds: report.retryRounds,
-          }
-        : null,
-    });
-  });
+      endpoints: ["/assets/:handle"],
+      source: "convex",
+    }),
+  );
 
-  app.get("/assets/:handle", async (c) => {
-    const handle = c.req.param("handle");
+  app.get(
+    "/assets/:handle",
+    cache({
+      cacheName: "coffee-index-assets-v1",
+      cacheControl: ASSETS_CACHE_CONTROL,
+      vary: "Origin",
+      cacheableStatusCodes: [200],
+      keyGenerator: (c) =>
+        new URL(
+          `/assets/${(c.req.param("handle") || "").toLowerCase()}`,
+          c.req.url,
+        ).toString(),
+      onCacheNotAvailable: false,
+    }),
+    async (c) => {
+      const convex = staticConvex || createConvexClient(c.env.CONVEX_URL);
+      if (!convex) {
+        return c.json({ error: "CONVEX_URL is not configured" }, 500);
+      }
 
-    try {
-      const manifest = await readManifest(handle);
-      if (!manifest) {
+      try {
+        const assets = await convex.query(api.assets.listAssetsByHandle, {
+          handle: c.req.param("handle"),
+        });
+
+        if (assets.length === 0) {
+          return c.json([], 404);
+        }
+
         return c.json(
-          {
-            error: "Assets not found for handle",
-            handle: canonicalHandle(handle),
-          },
-          404,
+          assets.map((asset) => ({
+            type: asset.mediaType,
+            url: asset.url,
+            postUrl: asset.postUrl,
+          })),
         );
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        return c.json({ error: "Failed to read Convex assets", message }, 500);
       }
-
-      const posts = manifest.posts.map((post) => ({
-        ...post,
-        images: post.images.map((image) => ({
-          ...image,
-          url: fileUrlFor(handle, image.fileName),
-        })),
-      }));
-
-      return c.json({
-        handle: manifest.handle,
-        manifest: {
-          ...manifest,
-          posts,
-        },
-        images: posts.map((post) => post.images),
-      });
-    } catch (error) {
-      const message = error instanceof Error ? error.message : String(error);
-      return c.json({ error: "Failed to read assets manifest", message }, 500);
-    }
-  });
-
-  app.get("/files/:handle/:filename", async (c) => {
-    const handle = c.req.param("handle");
-    const fileName = basename(c.req.param("filename"));
-    const filePath = join(handleAssetsDir(handle), fileName);
-
-    try {
-      const fileStat = await stat(filePath);
-      if (!fileStat.isFile()) {
-        return c.json({ error: "File not found" }, 404);
-      }
-
-      return new Response(Bun.file(filePath));
-    } catch {
-      return c.json({ error: "File not found" }, 404);
-    }
-  });
+    },
+  );
 
   app.notFound((c) => c.json({ error: "Not found" }, 404));
   app.onError((error, c) => {
@@ -134,19 +112,12 @@ function createApp(): Hono {
   return app;
 }
 
-async function main(): Promise<void> {
-  const app = createApp();
-  const server = Bun.serve({
-    port: Number(Bun.env.PORT || 3000),
-    fetch: app.fetch,
-  });
-
-  const handles = await listExistingAssetHandles();
-  console.log(`[server] listening on ${server.url}`);
-  console.log(`[server] serving ${handles.length} handle asset folders`);
-}
-
-main().catch((error) => {
-  console.error("[fatal]", error instanceof Error ? error.message : error);
-  process.exit(1);
-});
+export default {
+  fetch(request: Request, env: ApiEnv["Bindings"], executionCtx: unknown) {
+    return createApp(env.CONVEX_URL).fetch(
+      request,
+      env,
+      executionCtx as Parameters<Hono<ApiEnv>["fetch"]>[2],
+    );
+  },
+};
