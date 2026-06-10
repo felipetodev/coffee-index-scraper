@@ -1,11 +1,11 @@
 {
-  "generatedAt": "2026-06-08T15:21:55.703Z",
-  "startedAt": "2026-06-08T15:19:11.778Z",
-  "finishedAt": "2026-06-08T15:21:55.703Z",
-  "durationMs": 163925,
-  "duration": "2m 44s",
-  "totalHandles": 1,
-  "successfulHandles": 1,
+  "generatedAt": "2026-06-09T02:36:07.437Z",
+  "startedAt": "2026-06-09T00:34:10.626Z",
+  "finishedAt": "2026-06-09T02:36:07.437Z",
+  "durationMs": 7316811,
+  "duration": "2h 1m 57s",
+  "totalHandles": 40,
+  "successfulHandles": 40,
   "failedHandles": [],
   "retryRounds": 1
 }

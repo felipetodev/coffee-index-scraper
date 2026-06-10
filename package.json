@@ -12,9 +12,9 @@
     "dev:backup-api": "bun run --hot src/api/backup-dev.ts",
     "cf:dev": "wrangler dev",
     "cf:deploy": "wrangler deploy",
-    "insforge:bucket": "npx @insforge/cli storage create-bucket assets --public",
-    "reset:insforge": "npx @insforge/cli -y storage delete-bucket assets; bun run insforge:bucket; npx @insforge/cli db query \"delete from cafe_media;\"",
-    "sync:insforge": "find assets -type f ! -name manifest.json ! -name .DS_Store -exec sh -c 'for file do handle=$(basename \"$(dirname \"$file\")\"); base=$(basename \"$file\"); post=${base#post-}; post=${post%%-*}; ext=${base##*.}; key=\"$handle-post-$post.$ext\"; npx @insforge/cli storage upload \"$file\" --bucket assets --key \"$key\"; done' sh {} +",
+    "insforge:bucket": "bunx insforge storage create-bucket assets --public",
+    "reset:insforge": "bunx insforge storage delete-bucket assets -y && bun run insforge:bucket && bunx insforge db query \"delete from cafe_media;\"",
+    "sync:insforge": "find assets -type f ! -name manifest.json ! -name .DS_Store -exec sh -c 'for file do handle=$(basename \"$(dirname \"$file\")\"); base=$(basename \"$file\"); post=${base#post-}; post=${post%%-*}; ext=${base##*.}; key=\"$handle-post-$post.$ext\"; bunx insforge storage upload \"$file\" --bucket assets --key \"$key\"; done' sh {} +",
     "sync:insforge-media": "bun run src/sync-insforge-media.ts",
     "sync:insforge-all": "bun run reset:insforge && bun run sync:insforge && bun run sync:insforge-media"
   },
@@ -26,6 +26,7 @@
     "playwright-chromium": "^1.60.0"
   },
   "devDependencies": {
+    "@insforge/cli": "^0.1.87",
     "@types/bun": "latest",
     "wrangler": "^4.97.0"
   }
